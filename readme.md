@@ -162,6 +162,10 @@ You only need to do this once.
 
 </details>
 
+## Tools based on gpmc
+
+- Dockerized folder monitoring [Google Photos Uploader](https://github.com/giuseppe99barchetta/Google-Photos-Uploader) by @giuseppe99barchetta
+
 ## My Other Google Photos Scripts And Tools
 
 - Web api python client: [https://github.com/xob0t/google_photos_web_client](https://github.com/xob0t/google_photos_web_client)
