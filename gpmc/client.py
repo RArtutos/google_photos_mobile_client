@@ -168,19 +168,48 @@ class Client:
         )
 
     def _handle_album_creation(self, results: dict[str, str], album_name: str, show_progress: bool) -> None:
-        """
-        Handle album creation based on the provided album_name.
+    """
+    Handle album creation based on the provided album_name.
 
-        Args:
-            results: Dictionary mapping file paths to their Google Photos media keys.
-            album_name: Name of album to create. "AUTO" creates albums based on parent directories.
-            show_progress: Whether to display progress in the console.
-        """
-        if album_name != "AUTO":
-            # Add all media keys to the specified album
-            media_keys = list(results.values())
-            self.add_to_album(media_keys, album_name, show_progress=show_progress)
-            return
+    Args:
+        results: Dictionary mapping file paths to their Google Photos media keys.
+        album_name: Name of album to create.
+                    - A regular name -> all files go into that album.
+                    - "AUTO" -> albums created automatically based on folder structure
+                                relative to the upload target root.
+        show_progress: Whether to display progress in the console.
+    """
+    # Caso normal: nombre fijo
+    if album_name != "AUTO":
+        media_keys = list(results.values())
+        self.add_to_album(media_keys, album_name, show_progress=show_progress)
+        return
+
+    # 🔍 Detectar la raíz común de todos los archivos subidos (punto de partida del upload)
+    all_dirs = [str(Path(file_path).parent.resolve()) for file_path in results.keys()]
+    base_path = Path(os.path.commonpath(all_dirs))
+
+    media_keys_by_album = {}
+
+    for file_path, media_key in results.items():
+        parent_dir = Path(file_path).parent.resolve()
+
+        try:
+            # Resto de la ruta después del directorio base
+            relative_path = parent_dir.relative_to(base_path).as_posix()
+            # Si está directamente en la raíz → usar el nombre del root
+            album_name_from_path = relative_path or base_path.name
+        except ValueError:
+            # Si no pertenece al árbol base, usar solo el nombre de la carpeta
+            album_name_from_path = parent_dir.name
+
+        if album_name_from_path not in media_keys_by_album:
+            media_keys_by_album[album_name_from_path] = []
+        media_keys_by_album[album_name_from_path].append(media_key)
+
+    # Crear álbumes
+    for album_name_from_path, media_keys in media_keys_by_album.items():
+        self.add_to_album(media_keys, album_name_from_path, show_progress=show_progress)
 
         # Group media keys by the full path of their parent directory
         media_keys_by_album = {}
