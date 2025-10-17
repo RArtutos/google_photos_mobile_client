@@ -167,48 +167,48 @@ class Client:
             hash_bytes,
         )
 
-
     def _handle_album_creation(self, results: dict[str, str], album_name: str, show_progress: bool) -> None:
-    """
-    Handle album creation based on the provided album_name.
-    - Regular name: all files go into that album.
-    - "AUTO": albums created based on folder structure relative to upload root.
-    """
+        """
+        Handle album creation based on the provided album_name.
+        - Regular name: all files go into that album.
+        - "AUTO": albums created based on folder structure relative to upload root.
+        """
 
-    # Caso 1: nombre fijo → todos los archivos al mismo álbum
-    if album_name != "AUTO":
-        media_keys = list(results.values())
-        self.add_to_album(media_keys, album_name, show_progress=show_progress)
-        return
+        # Caso 1: nombre fijo → todos los archivos al mismo álbum
+        if album_name != "AUTO":
+            media_keys = list(results.values())
+            self.add_to_album(media_keys, album_name, show_progress=show_progress)
+            return
 
-    # Caso 2: "AUTO" → crea álbumes según la estructura de carpetas relativa
-    all_dirs = [str(Path(p).parent.resolve()) for p in results.keys()]
-    base_path = Path(os.path.commonpath(all_dirs))
+        # Caso 2: "AUTO" → crea álbumes según la estructura de carpetas relativa
+        all_dirs = [str(Path(p).parent.resolve()) for p in results.keys()]
+        base_path = Path(os.path.commonpath(all_dirs))
 
-    media_keys_by_album: dict[str, list[str]] = {}
+        media_keys_by_album: dict[str, list[str]] = {}
 
-    for file_path, media_key in results.items():
-        parent_dir = Path(file_path).parent.resolve()
+        for file_path, media_key in results.items():
+            parent_dir = Path(file_path).parent.resolve()
 
-        try:
-            # Obtener la ruta relativa a la raíz de subida
-            relative_path = parent_dir.relative_to(base_path).as_posix()
-            album_name_from_path = relative_path or base_path.name
-        except ValueError:
-            # Si el archivo no pertenece al árbol base
-            album_name_from_path = parent_dir.name
+            try:
+                # Obtener la ruta relativa a la raíz de subida
+                relative_path = parent_dir.relative_to(base_path).as_posix()
+                album_name_from_path = relative_path or base_path.name
+            except ValueError:
+                # Si el archivo no pertenece al árbol base
+                album_name_from_path = parent_dir.name
 
-        # Agrupar por álbum
-        media_keys_by_album.setdefault(album_name_from_path, []).append(media_key)
+            # Agrupar por álbum
+            media_keys_by_album.setdefault(album_name_from_path, []).append(media_key)
 
-    # Crear los álbumes en orden jerárquico (padres antes)
-    for album_name_from_path in sorted(media_keys_by_album.keys(), key=lambda x: x.count("/")):
-        self.add_to_album(
-            media_keys_by_album[album_name_from_path],
-            album_name_from_path,
-            show_progress=show_progress,
-        )
-        def _filter_files(expression: str, filter_exclude: bool, filter_regex: bool, filter_ignore_case: bool, filter_path: bool, paths: list[Path]) -> list[Path]:
+        # Crear los álbumes en orden jerárquico (padres antes)
+        for album_name_from_path in sorted(media_keys_by_album.keys(), key=lambda x: x.count("/")):
+            self.add_to_album(
+                media_keys_by_album[album_name_from_path],
+                album_name_from_path,
+                show_progress=show_progress,
+            )
+
+    def _filter_files(self, expression: str, filter_exclude: bool, filter_regex: bool, filter_ignore_case: bool, filter_path: bool, paths: list[Path]) -> list[Path]:
         """
         Filter a list of Path objects based on a filter expression.
 
@@ -322,7 +322,7 @@ class Client:
         )
 
         if album_name:
-            self.(results, album_name, show_progress)
+            self._handle_album_creation(results, album_name, show_progress)
 
         if delete_from_host:
             for file_path, _ in results.items():
@@ -364,9 +364,7 @@ class Client:
         if isinstance(target, (str, Path)):
             target = [target]
 
-            if not isinstance(target, Sequence) or not all(isinstance(p, (str, Path)) for p in target):
-                raise TypeError("`target` must be a file path, a directory path, or a squence of such paths.")
-
+        if isinstance(target, Sequence) and all(isinstance(p, (str, Path)) for p in target):
             # Expand all paths to a flat list of files
             files_to_upload = [file for path in target for file in self._search_for_media_files(path, recursive=recursive)]
 
@@ -379,11 +377,13 @@ class Client:
             if not files_to_upload:
                 raise ValueError("No media files left after filtering.")
 
-            for path in files_to_upload:
-                path_hash_pairs[path] = b""  # epmty hash values to be calculated later
+            path_hash_pairs = {path: b"" for path in files_to_upload}  # empty hash values to be calculated later
 
         elif isinstance(target, dict) and all(isinstance(k, Path) and isinstance(v, (bytes, str)) for k, v in target.items()):
             path_hash_pairs = target
+        else:
+            raise TypeError("`target` must be a file path, a directory path, or a sequence of such paths.")
+        
         return path_hash_pairs
 
     def _search_for_media_files(self, path: str | Path, recursive: bool) -> list[Path]:
@@ -424,7 +424,12 @@ class Client:
         if len(files) == 0:
             raise ValueError("No files in the directory.")
 
-        media_files = [file for file in files if any(mimetype_guess is not None and mimetype_guess.startswith(mimetype) for mimetype in self.valid_mimetypes if (mimetype_guess := mimetypes.guess_type(file)[0]) is not None)]
+        media_files = [
+            file for file in files 
+            if any(mimetype_guess is not None and mimetype_guess.startswith(mimetype) 
+                  for mimetype in self.valid_mimetypes 
+                  if (mimetype_guess := mimetypes.guess_type(file)[0]))
+        ]
 
         if len(media_files) == 0:
             raise ValueError("No files in the directory matched image or video mime types")
@@ -483,7 +488,18 @@ class Client:
         overall_task_id = overall_progress.add_task("Errors: 0", total=len(path_hash_pairs.keys()), visible=show_progress)
         with context:
             with ThreadPoolExecutor(max_workers=threads) as executor:
-                futures = {executor.submit(self._upload_file, path, hash_value, progress=file_progress, force_upload=force_upload, use_quota=use_quota, saver=saver): (path, hash_value) for path, hash_value in path_hash_pairs.items()}
+                futures = {
+                    executor.submit(
+                        self._upload_file, 
+                        path, 
+                        hash_value, 
+                        progress=file_progress, 
+                        force_upload=force_upload, 
+                        use_quota=use_quota, 
+                        saver=saver
+                    ): path 
+                    for path, hash_value in path_hash_pairs.items()
+                }
                 for future in as_completed(futures):
                     file = futures[future]
                     try:
