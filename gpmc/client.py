@@ -166,65 +166,47 @@ class Client:
         return self.api.find_remote_media_by_hash(
             hash_bytes,
         )
+          def _handle_album_creation(self, results: dict[str, str], album_name: str, show_progress: bool) -> None:
+        """
+        Handle album creation based on the provided album_name.
+        - Regular name: all files go into that album.
+        - "AUTO": albums created based on folder structure relative to upload root.
+        """
 
-    def _handle_album_creation(self, results: dict[str, str], album_name: str, show_progress: bool) -> None:
-    """
-    Handle album creation based on the provided album_name.
+        # Caso 1: nombre fijo → todos los archivos al mismo álbum
+        if album_name != "AUTO":
+            media_keys = list(results.values())
+            self.add_to_album(media_keys, album_name, show_progress=show_progress)
+            return
 
-    Args:
-        results: Dictionary mapping file paths to their Google Photos media keys.
-        album_name: Name of album to create.
-                    - A regular name -> all files go into that album.
-                    - "AUTO" -> albums created automatically based on folder structure
-                                relative to the upload target root.
-        show_progress: Whether to display progress in the console.
-    """
-    # Caso normal: nombre fijo
-    if album_name != "AUTO":
-        media_keys = list(results.values())
-        self.add_to_album(media_keys, album_name, show_progress=show_progress)
-        return
+        # Caso 2: "AUTO" → crea álbumes según la estructura de carpetas relativa
+        all_dirs = [str(Path(p).parent.resolve()) for p in results.keys()]
+        base_path = Path(os.path.commonpath(all_dirs))
 
-    # 🔍 Detectar la raíz común de todos los archivos subidos (punto de partida del upload)
-    all_dirs = [str(Path(file_path).parent.resolve()) for file_path in results.keys()]
-    base_path = Path(os.path.commonpath(all_dirs))
+        media_keys_by_album: dict[str, list[str]] = {}
 
-    media_keys_by_album = {}
-
-    for file_path, media_key in results.items():
-        parent_dir = Path(file_path).parent.resolve()
-
-        try:
-            # Resto de la ruta después del directorio base
-            relative_path = parent_dir.relative_to(base_path).as_posix()
-            # Si está directamente en la raíz → usar el nombre del root
-            album_name_from_path = relative_path or base_path.name
-        except ValueError:
-            # Si no pertenece al árbol base, usar solo el nombre de la carpeta
-            album_name_from_path = parent_dir.name
-
-        if album_name_from_path not in media_keys_by_album:
-            media_keys_by_album[album_name_from_path] = []
-        media_keys_by_album[album_name_from_path].append(media_key)
-
-    # Crear álbumes
-    for album_name_from_path, media_keys in media_keys_by_album.items():
-        self.add_to_album(media_keys, album_name_from_path, show_progress=show_progress)
-
-        # Group media keys by the full path of their parent directory
-        media_keys_by_album = {}
         for file_path, media_key in results.items():
-            parent_dir = Path(file_path).parent.resolve().as_posix()
-            if parent_dir not in media_keys_by_album:
-                media_keys_by_album[parent_dir] = []
-            media_keys_by_album[parent_dir].append(media_key)
+            parent_dir = Path(file_path).parent.resolve()
 
-        for parent_dir, media_keys in media_keys_by_album.items():
-            album_name_from_path = Path(parent_dir).name  # Use the directory name as the album name
-            self.add_to_album(media_keys, album_name_from_path, show_progress=show_progress)
+            try:
+                # Obtener la ruta relativa a la raíz de subida
+                relative_path = parent_dir.relative_to(base_path).as_posix()
+                album_name_from_path = relative_path or base_path.name
+            except ValueError:
+                # Si el archivo no pertenece al árbol base
+                album_name_from_path = parent_dir.name
 
-    @staticmethod
-    def _filter_files(expression: str, filter_exclude: bool, filter_regex: bool, filter_ignore_case: bool, filter_path: bool, paths: list[Path]) -> list[Path]:
+            # Agrupar por álbum
+            media_keys_by_album.setdefault(album_name_from_path, []).append(media_key)
+
+        # Crear los álbumes en orden jerárquico (padres antes)
+        for album_name_from_path in sorted(media_keys_by_album.keys(), key=lambda x: x.count("/")):
+            self.add_to_album(
+                media_keys_by_album[album_name_from_path],
+                album_name_from_path,
+                show_progress=show_progress,
+            )        
+      def _filter_files(expression: str, filter_exclude: bool, filter_regex: bool, filter_ignore_case: bool, filter_path: bool, paths: list[Path]) -> list[Path]:
         """
         Filter a list of Path objects based on a filter expression.
 
@@ -338,7 +320,7 @@ class Client:
         )
 
         if album_name:
-            self._handle_album_creation(results, album_name, show_progress)
+            self.(results, album_name, show_progress)
 
         if delete_from_host:
             for file_path, _ in results.items():
