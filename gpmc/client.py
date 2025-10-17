@@ -166,7 +166,9 @@ class Client:
         return self.api.find_remote_media_by_hash(
             hash_bytes,
         )
-          def _handle_album_creation(self, results: dict[str, str], album_name: str, show_progress: bool) -> None:
+
+
+    def _handle_album_creation(self, results: dict[str, str], album_name: str, show_progress: bool) -> None:
         """
         Handle album creation based on the provided album_name.
         - Regular name: all files go into that album.
@@ -205,8 +207,8 @@ class Client:
                 media_keys_by_album[album_name_from_path],
                 album_name_from_path,
                 show_progress=show_progress,
-            )        
-      def _filter_files(expression: str, filter_exclude: bool, filter_regex: bool, filter_ignore_case: bool, filter_path: bool, paths: list[Path]) -> list[Path]:
+            )
+    def _filter_files(expression: str, filter_exclude: bool, filter_regex: bool, filter_ignore_case: bool, filter_path: bool, paths: list[Path]) -> list[Path]:
         """
         Filter a list of Path objects based on a filter expression.
 
