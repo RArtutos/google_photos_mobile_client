@@ -191,21 +191,42 @@ class Client:
         
         # Obtener todas las rutas absolutas de los directorios padres
         all_files_paths = [Path(p) for p in results.keys()]
-        all_dirs = [file_path.parent.resolve() for file_path in all_files_paths]
         
         # Determinar la ruta base para el cálculo de rutas relativas
         if custom_base_path:
             base_path = custom_base_path
         else:
-            # Encontrar el directorio común más profundo
-            common_path = os.path.commonpath([str(d) for d in all_dirs])
+            # En lugar de usar commonpath, intentar deducir el directorio de subida a partir de las rutas
+            # Encontrar el directorio común más profundo como punto de partida
+            common_path = os.path.commonpath([str(p) for p in all_files_paths])
             base_path = Path(common_path)
             
-            # Si la ruta común es exactamente la ruta de uno de los directorios,
-            # usar su directorio padre como base para obtener nombres más significativos
-            if any(str(base_path) == str(d) for d in all_dirs):
-                if base_path.parent != base_path:  # Evitar root
-                    base_path = base_path.parent
+            # Si base_path es un archivo, obtener su directorio padre
+            if base_path.is_file():
+                base_path = base_path.parent
+                
+            # Intentar encontrar el último componente significativo de la ruta (el directorio de subida)
+            # Esto asume que el usuario está subiendo desde un directorio específico, como "prueba"
+            path_parts = base_path.parts
+            
+            # El directorio de subida suele ser el último componente de la ruta común
+            # o el penúltimo si todos los archivos están en un subdirectorio común
+            upload_dir_name = base_path.name
+            
+            # Si el directorio base es "root" u otro directorio del sistema, buscar un mejor candidato
+            system_dirs = ["root", "home", "usr", "var", "etc", "opt", "mnt", "media", "tmp"]
+            if upload_dir_name in system_dirs:
+                # Buscar en las rutas de archivos el primer directorio no del sistema
+                for file_path in all_files_paths:
+                    path_parts = file_path.parts
+                    for i, part in enumerate(path_parts):
+                        if part not in system_dirs and i > 0:
+                            upload_dir_name = part
+                            # Ajustar base_path para que sea el directorio que contiene este componente
+                            base_path = Path('/'.join(file_path.parts[:i+1]))
+                            break
+                    if upload_dir_name not in system_dirs:
+                        break
         
         self.logger.info(f"Base path para álbumes AUTO: {base_path}")
         
@@ -213,32 +234,42 @@ class Client:
         media_keys_by_album: dict[str, list[str]] = {}
         
         for file_path, media_key in results.items():
-            parent_dir = Path(file_path).parent.resolve()
+            file_path_obj = Path(file_path)
+            parent_dir = file_path_obj.parent.resolve()
             
             try:
-                # Obtener la ruta relativa respecto a la base
+                # Si el archivo está directamente en el directorio base
                 if str(parent_dir) == str(base_path):
-                    # Si está directamente en la base, usar el nombre de la carpeta base
+                    # Usar el nombre del directorio base como nombre del álbum
                     album_name_from_path = base_path.name
                 else:
-                    # Calcular la ruta relativa
+                    # Calcular la ruta relativa al directorio base
                     relative_path = parent_dir.relative_to(base_path)
                     rel_path_str = relative_path.as_posix()
                     
                     if rel_path_str == ".":
-                        # Si es ".", usar el último componente significativo de la ruta
-                        album_name_from_path = parent_dir.name
+                        # Si la ruta relativa es ".", usar el nombre del directorio base
+                        album_name_from_path = base_path.name
                     else:
-                        # Prefijo con el nombre de la carpeta base para mejor organización
+                        # Crear un nombre de álbum con el formato "directorio_base/ruta_relativa"
                         album_name_from_path = f"{base_path.name}/{rel_path_str}"
+                        
+                        # Eliminar prefijos del sistema si están presentes
+                        for system_dir in ["root/", "home/", "usr/", "var/", "etc/", "opt/", "mnt/", "media/", "tmp/"]:
+                            if album_name_from_path.startswith(system_dir):
+                                album_name_from_path = album_name_from_path[len(system_dir):]
             except ValueError:
-                # Si el archivo está fuera del árbol de base_path
-                # Usar el nombre del directorio padre como nombre del álbum
+                # Si el archivo está fuera del árbol del directorio base
+                # (esto no debería ocurrir con la lógica mejorada)
                 album_name_from_path = parent_dir.name
             
             # Asegurarse de que el nombre no esté vacío
             if not album_name_from_path or album_name_from_path == ".":
                 album_name_from_path = "Uploads"  # Nombre genérico como último recurso
+                
+            # Eliminar cualquier prefijo de "root/" que pueda quedar
+            if album_name_from_path.startswith("root/"):
+                album_name_from_path = album_name_from_path[5:]
             
             # Agrupar por álbum
             media_keys_by_album.setdefault(album_name_from_path, []).append(media_key)
