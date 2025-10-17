@@ -172,36 +172,80 @@ class Client:
         Handle album creation based on the provided album_name.
         - Regular name: all files go into that album.
         - "AUTO": albums created based on folder structure relative to upload root.
+        - "AUTO=/custom/path": albums created based on folder structure relative to specified path.
         """
-
         # Caso 1: nombre fijo → todos los archivos al mismo álbum
-        if album_name != "AUTO":
+        if not album_name.startswith("AUTO"):
             media_keys = list(results.values())
             self.add_to_album(media_keys, album_name, show_progress=show_progress)
             return
 
-        # Caso 2: "AUTO" → crea álbumes según la estructura de carpetas relativa
-        all_dirs = [str(Path(p).parent.resolve()) for p in results.keys()]
-        base_path = Path(os.path.commonpath(all_dirs))
-
+        # Caso 2: "AUTO" o "AUTO=/ruta/base" → crear álbumes según estructura de carpetas
+        # Extraer la ruta base personalizada si se proporciona
+        custom_base_path = None
+        if album_name.startswith("AUTO="):
+            custom_base_path = Path(album_name[5:])
+            if not custom_base_path.exists() or not custom_base_path.is_dir():
+                self.logger.warning(f"La ruta base especificada no existe: {custom_base_path}")
+                custom_base_path = None
+        
+        # Obtener todas las rutas absolutas de los directorios padres
+        all_files_paths = [Path(p) for p in results.keys()]
+        all_dirs = [file_path.parent.resolve() for file_path in all_files_paths]
+        
+        # Determinar la ruta base para el cálculo de rutas relativas
+        if custom_base_path:
+            base_path = custom_base_path
+        else:
+            # Encontrar el directorio común más profundo
+            common_path = os.path.commonpath([str(d) for d in all_dirs])
+            base_path = Path(common_path)
+            
+            # Si la ruta común es exactamente la ruta de uno de los directorios,
+            # usar su directorio padre como base para obtener nombres más significativos
+            if any(str(base_path) == str(d) for d in all_dirs):
+                if base_path.parent != base_path:  # Evitar root
+                    base_path = base_path.parent
+        
+        self.logger.info(f"Base path para álbumes AUTO: {base_path}")
+        
+        # Agrupar archivos por sus rutas relativas para formar álbumes
         media_keys_by_album: dict[str, list[str]] = {}
-
+        
         for file_path, media_key in results.items():
             parent_dir = Path(file_path).parent.resolve()
-
+            
             try:
-                # Obtener la ruta relativa a la raíz de subida
-                relative_path = parent_dir.relative_to(base_path).as_posix()
-                album_name_from_path = relative_path or base_path.name
+                # Obtener la ruta relativa respecto a la base
+                if str(parent_dir) == str(base_path):
+                    # Si está directamente en la base, usar el nombre de la carpeta base
+                    album_name_from_path = base_path.name
+                else:
+                    # Calcular la ruta relativa
+                    relative_path = parent_dir.relative_to(base_path)
+                    rel_path_str = relative_path.as_posix()
+                    
+                    if rel_path_str == ".":
+                        # Si es ".", usar el último componente significativo de la ruta
+                        album_name_from_path = parent_dir.name
+                    else:
+                        # Prefijo con el nombre de la carpeta base para mejor organización
+                        album_name_from_path = f"{base_path.name}/{rel_path_str}"
             except ValueError:
-                # Si el archivo no pertenece al árbol base
+                # Si el archivo está fuera del árbol de base_path
+                # Usar el nombre del directorio padre como nombre del álbum
                 album_name_from_path = parent_dir.name
-
+            
+            # Asegurarse de que el nombre no esté vacío
+            if not album_name_from_path or album_name_from_path == ".":
+                album_name_from_path = "Uploads"  # Nombre genérico como último recurso
+            
             # Agrupar por álbum
             media_keys_by_album.setdefault(album_name_from_path, []).append(media_key)
-
-        # Crear los álbumes en orden jerárquico (padres antes)
+        
+        # Crear los álbumes en orden jerárquico (padres antes que hijos)
         for album_name_from_path in sorted(media_keys_by_album.keys(), key=lambda x: x.count("/")):
+            self.logger.info(f"Creando álbum AUTO: {album_name_from_path}")
             self.add_to_album(
                 media_keys_by_album[album_name_from_path],
                 album_name_from_path,
@@ -383,7 +427,7 @@ class Client:
             path_hash_pairs = target
         else:
             raise TypeError("`target` must be a file path, a directory path, or a sequence of such paths.")
-        
+            
         return path_hash_pairs
 
     def _search_for_media_files(self, path: str | Path, recursive: bool) -> list[Path]:
@@ -405,7 +449,9 @@ class Client:
         path = Path(path)
 
         if path.is_file():
-            if any(mimetype_guess is not None and mimetype_guess.startswith(mimetype) for mimetype in self.valid_mimetypes if (mimetype_guess := mimetypes.guess_type(path)[0])):
+            if any(mimetype_guess is not None and mimetype_guess.startswith(mimetype) 
+                   for mimetype in self.valid_mimetypes 
+                   if (mimetype_guess := mimetypes.guess_type(path)[0])):
                 return [path]
             raise ValueError("File's mime type does not match image or video mime type.")
 
@@ -504,7 +550,7 @@ class Client:
                     file = futures[future]
                     try:
                         media_key_dict = future.result()
-                        uploaded_files = uploaded_files | media_key_dict
+                        uploaded_files.update(media_key_dict)
                     except Exception as e:
                         self.logger.error(f"Error uploading file {file}: {e}")
                         upload_error_count += 1
