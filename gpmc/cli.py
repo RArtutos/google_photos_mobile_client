@@ -32,6 +32,11 @@ def main():
     parser.add_argument("--timeout", type=int, default=30, help=f"Requests timeout, seconds. Defaults to {DEFAULT_TIMEOUT}.")
     parser.add_argument("--log-level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Set the logging level (default: INFO)")
 
+    # Resume/Restart options
+    parser.add_argument("--resume", action="store_true", help="Resume an interrupted upload for the same path/album if found.")
+    parser.add_argument("--resume-session", type=str, help="Resume a specific session ID.")
+    parser.add_argument("--restart", action="store_true", help="Ignore checkpoints and start fresh.")
+
     filter_group = parser.add_argument_group("File Filter Options")
     filter_group.add_argument("--filter", type=str, help="Filter expression.")
     filter_group.add_argument("--exclude", action="store_true", help="Exclude files matching the filter.")
@@ -65,5 +70,8 @@ def main():
         filter_regex=args.regex,
         filter_ignore_case=args.ignore_case,
         filter_path=args.match_path,
+        resume_session=args.resume_session,
+        resume=args.resume,
+        restart=args.restart,
     )
     pp(output)

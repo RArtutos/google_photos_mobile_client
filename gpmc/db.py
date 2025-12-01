@@ -74,6 +74,13 @@ class Storage:
         """)
 
         self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS album_mappings (
+            folder_path TEXT PRIMARY KEY,
+            album_name TEXT
+        )
+        """)
+        
+        self.conn.execute("""
         INSERT OR IGNORE INTO state (id, state_token, page_token, init_complete)
         VALUES (1, '', '', 0)
         """)
@@ -171,3 +178,29 @@ class Storage:
     def close(self) -> None:
         """Close the database connection."""
         self.conn.close()
+
+    def get_album_mapping(self, folder_path: str | Path) -> str | None:
+        """Get album name mapped to a folder path, if any."""
+        cursor = self.conn.execute(
+            "SELECT album_name FROM album_mappings WHERE folder_path = ?",
+            (str(folder_path),),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+    def set_album_mapping(self, folder_path: str | Path, album_name: str) -> None:
+        """Persist mapping from folder path to album name."""
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO album_mappings (folder_path, album_name)
+                VALUES (?, ?)
+                ON CONFLICT(folder_path) DO UPDATE SET album_name = excluded.album_name
+                """,
+                (str(folder_path), album_name),
+            )
+
+    def get_all_album_mappings(self) -> dict[str, str]:
+        """Return all folder→album mappings."""
+        cursor = self.conn.execute("SELECT folder_path, album_name FROM album_mappings")
+        return {folder: album for folder, album in cursor.fetchall()}

@@ -71,12 +71,15 @@ options:
   -h, --help            show this help message and exit
   --auth_data AUTH_DATA
                         Google auth data for authentication. If not provided, `GP_AUTH_DATA` env variable will be used.
-  --album ALBUM         Add uploaded media to an album with given name. If set to 'AUTO', albums will be created based on the immediate parent directory of each file.
+  --album ALBUM         Album naming: fixed name, 'AUTO' to group by folders, or 'AUTO=/base/path' to control the base used for grouping.
                         Example for using 'AUTO':
                         When uploading '/foo':
                         '/foo/image1.jpg' goes to 'foo'
                         '/foo/bar/image2.jpg' goes to 'bar'
                         '/foo/bar/foo/image3.jpg' goes to 'foo' (distinct from the first 'foo' album)
+                        Example for using 'AUTO=/foo':
+                        '/foo/bar/image2.jpg' goes to 'foo/bar'
+                        '/foo/bar/baz/image3.jpg' goes to 'foo/bar/baz'
   --proxy PROXY         Proxy to use. Format: `protocol://username:password@host:port`
   --progress            Display upload progress.
   --recursive           Scan the directory recursively.
@@ -161,6 +164,24 @@ You only need to do this once.
   3. Try `Android App via Frida` interception method in HTTP Toolkit.
 
 </details>
+
+## Album Naming
+
+- Fixed name: set `--album "Nombre"` to group all files in one album.
+- `AUTO`: groups by folder relative to the common base path among files.
+- `AUTO=/base/path`: chooses a custom base path for grouping (use absolute path).
+- Persistence: folder→album mappings are saved to `~/.gpmc/<email>/storage.db` to keep names consistent when adding files later.
+- Logs: album assignment is logged to help track grouping decisions.
+
+## Retry Mechanism
+
+- Uploads retry up to 10 times with random waits between 1 and 10 seconds.
+- Each failed attempt is logged with the error and wait duration.
+- After exhausting retries, the system continues with the next file.
+
+## Tests
+
+- Offline unit tests validate album grouping logic: see `tests/album_grouping_test.py`.
 
 ## Tools based on gpmc
 

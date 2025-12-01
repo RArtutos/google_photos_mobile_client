@@ -3,9 +3,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import signal
 from contextlib import nullcontext
 import os
+import time
+import random
 import re
 import mimetypes
 from pathlib import Path
+import requests
 
 from rich.console import Group
 from rich.live import Live
@@ -27,12 +30,57 @@ from .api import Api, DEFAULT_TIMEOUT
 from . import utils
 from .hash_handler import calculate_sha1_hash, convert_sha1_hash
 from .db_update_parser import parse_db_update
+from .metadata_cache import MetadataCache
+from .album_progress import AlbumProgressTracker
+from .detailed_progress import DetailedProgressTracker
+from .checkpoint_manager import CheckpointManager
+from .resume_manager import ResumeManager
+from .interruption_handler import InterruptionHandler
+from .enhanced_logging import checkpoint_logger
+from .album_validator import album_validator
+from .exceptions import UploadRejected
 
 # Make Ctrl+C work for cancelling threads
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 
 LogLevel = Literal["INFO", "DEBUG", "WARNING", "ERROR", "CRITICAL"]
+
+
+class NullProgress:
+    def add_task(self, *args, **kwargs):
+        return 0
+
+    def update(self, *args, **kwargs):
+        pass
+
+    def reset(self, *args, **kwargs):
+        pass
+
+    def open(self, file_path, mode, task_id=None):
+        return open(file_path, mode)
+
+# Wrapper para archivo que reporta bytes leídos al DetailedProgressTracker
+class ReadProgressWrapper:
+    def __init__(self, raw, file_path: Path, tracker: DetailedProgressTracker):
+        self._raw = raw
+        self._file_path = file_path
+        self._tracker = tracker
+        self._uploaded = 0
+
+    def read(self, size: int = -1):
+        chunk = self._raw.read(size)
+        if chunk:
+            self._uploaded += len(chunk)
+            try:
+                # Reportar bytes subidos hasta ahora
+                self._tracker.update_file_progress(self._file_path, self._uploaded)
+            except Exception:
+                pass
+        return chunk
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
 
 
 class Client:
@@ -66,6 +114,8 @@ class Client:
         self.api = Api(self.auth_data, proxy=proxy, language=self.language, timeout=timeout)
         self.cache_dir = Path.home() / ".gpmc" / email
         self.db_path = self.cache_dir / "storage.db"
+        self.metadata_cache = MetadataCache(self.cache_dir)
+        self._albums_state: dict[str, dict[str, object]] = {}
 
     def _handle_auth_data(self, auth_data: str | None) -> str:
         """
@@ -89,7 +139,7 @@ class Client:
 
         raise ValueError("`GP_AUTH_DATA` environment variable not set. Create it or provide `auth_data` as an argument.")
 
-    def _upload_file(self, file_path: str | Path, hash_value: bytes | str, progress: Progress, force_upload: bool, use_quota: bool, saver: bool) -> dict[str, str]:
+    def _upload_file(self, file_path: str | Path, hash_value: bytes | str, progress: Progress, force_upload: bool, use_quota: bool, saver: bool, detailed_tracker: DetailedProgressTracker | None = None) -> dict[str, str]:
         """
         Upload a single file to Google Photos.
 
@@ -101,6 +151,7 @@ class Client:
             force_upload: Whether to upload the file even if it's already present in Google Photos.
             use_quota: Uploaded files will count against your Google Photos storage quota.
             saver: Upload files in storage saver quality.
+            detailed_tracker: Detailed tracker to update per-byte progress when available.
 
         Returns:
             dict[str, str]: A dictionary mapping the absolute file path to its Google Photos media key.
@@ -128,8 +179,17 @@ class Client:
             upload_token = self.api.get_upload_token(hash_b64, file_size)
             progress.reset(task_id=file_progress_id)
             progress.update(task_id=file_progress_id, description=f"Uploading: {file_path.name}")
-            with progress.open(file_path, "rb", task_id=file_progress_id) as file:
-                upload_response = self.api.upload_file(file=file, upload_token=upload_token)
+
+            if detailed_tracker is not None:
+                # Usar wrapper que reporta bytes leídos al tracker detallado
+                with open(file_path, "rb") as raw:
+                    file_obj = ReadProgressWrapper(raw, file_path, detailed_tracker)
+                    upload_response = self.api.upload_file(file=file_obj, upload_token=upload_token)
+            else:
+                # Fallback: usar progreso tradicional de Rich
+                with progress.open(file_path, "rb", task_id=file_progress_id) as file:
+                    upload_response = self.api.upload_file(file=file, upload_token=upload_token)
+
             progress.update(task_id=file_progress_id, description=f"Finalizing Upload: {file_path.name}")
             last_modified_timestamp = int(os.path.getmtime(file_path))
             model = "Pixel XL"
@@ -174,114 +234,58 @@ class Client:
         - "AUTO": albums created based on folder structure relative to upload root.
         - "AUTO=/custom/path": albums created based on folder structure relative to specified path.
         """
-        # Caso 1: nombre fijo → todos los archivos al mismo álbum
-        if not album_name.startswith("AUTO"):
-            media_keys = list(results.values())
-            self.add_to_album(media_keys, album_name, show_progress=show_progress)
-            return
+        # Calcular grupos de álbum de forma consistente y descriptiva
+        groups = utils.compute_album_groups(results, album_name)
+        self.logger.info(f"Álbumes calculados ({len(groups)}): {', '.join(groups.keys())}")
 
-        # Caso 2: "AUTO" o "AUTO=/ruta/base" → crear álbumes según estructura de carpetas
-        # Extraer la ruta base personalizada si se proporciona
-        custom_base_path = None
-        if album_name.startswith("AUTO="):
-            custom_base_path = Path(album_name[5:])
-            if not custom_base_path.exists() or not custom_base_path.is_dir():
-                self.logger.warning(f"La ruta base especificada no existe: {custom_base_path}")
-                custom_base_path = None
+        # Validar nombres de álbum antes de crear
+        album_names = list(groups.keys())
+        validation_results = album_validator.validate_album_names_batch(album_names)
         
-        # Obtener todas las rutas absolutas de los directorios padres
-        all_files_paths = [Path(p) for p in results.keys()]
+        # Registrar resultados de validación
+        album_validator.log_validation_results(album_names)
         
-        # Determinar la ruta base para el cálculo de rutas relativas
-        if custom_base_path:
-            base_path = custom_base_path
-        else:
-            # En lugar de usar commonpath, intentar deducir el directorio de subida a partir de las rutas
-            # Encontrar el directorio común más profundo como punto de partida
-            common_path = os.path.commonpath([str(p) for p in all_files_paths])
-            base_path = Path(common_path)
-            
-            # Si base_path es un archivo, obtener su directorio padre
-            if base_path.is_file():
-                base_path = base_path.parent
-                
-            # Intentar encontrar el último componente significativo de la ruta (el directorio de subida)
-            # Esto asume que el usuario está subiendo desde un directorio específico, como "prueba"
-            path_parts = base_path.parts
-            
-            # El directorio de subida suele ser el último componente de la ruta común
-            # o el penúltimo si todos los archivos están en un subdirectorio común
-            upload_dir_name = base_path.name
-            
-            # Si el directorio base es "root" u otro directorio del sistema, buscar un mejor candidato
-            system_dirs = ["root", "home", "usr", "var", "etc", "opt", "mnt", "media", "tmp"]
-            if upload_dir_name in system_dirs:
-                # Buscar en las rutas de archivos el primer directorio no del sistema
-                for file_path in all_files_paths:
-                    path_parts = file_path.parts
-                    for i, part in enumerate(path_parts):
-                        if part not in system_dirs and i > 0:
-                            upload_dir_name = part
-                            # Ajustar base_path para que sea el directorio que contiene este componente
-                            base_path = Path('/'.join(file_path.parts[:i+1]))
-                            break
-                    if upload_dir_name not in system_dirs:
-                        break
+        # Aplicar sanitización a nombres inválidos
+        sanitized_groups = {}
+        name_mapping = {}  # original -> sanitized
         
-        self.logger.info(f"Base path para álbumes AUTO: {base_path}")
-        
-        # Agrupar archivos por sus rutas relativas para formar álbumes
-        media_keys_by_album: dict[str, list[str]] = {}
-        
-        for file_path, media_key in results.items():
-            file_path_obj = Path(file_path)
-            parent_dir = file_path_obj.parent.resolve()
+        for original_name, media_keys in groups.items():
+            is_valid, errors, sanitized_name = validation_results[original_name]
             
-            try:
-                # Si el archivo está directamente en el directorio base
-                if str(parent_dir) == str(base_path):
-                    # Usar el nombre del directorio base como nombre del álbum
-                    album_name_from_path = base_path.name
-                else:
-                    # Calcular la ruta relativa al directorio base
-                    relative_path = parent_dir.relative_to(base_path)
-                    rel_path_str = relative_path.as_posix()
-                    
-                    if rel_path_str == ".":
-                        # Si la ruta relativa es ".", usar el nombre del directorio base
-                        album_name_from_path = base_path.name
-                    else:
-                        # Crear un nombre de álbum con el formato "directorio_base/ruta_relativa"
-                        album_name_from_path = f"{base_path.name}/{rel_path_str}"
-                        
-                        # Eliminar prefijos del sistema si están presentes
-                        for system_dir in ["root/", "home/", "usr/", "var/", "etc/", "opt/", "mnt/", "media/", "tmp/"]:
-                            if album_name_from_path.startswith(system_dir):
-                                album_name_from_path = album_name_from_path[len(system_dir):]
-            except ValueError:
-                # Si el archivo está fuera del árbol del directorio base
-                # (esto no debería ocurrir con la lógica mejorada)
-                album_name_from_path = parent_dir.name
+            if not is_valid:
+                self.logger.warning(f"Nombre de álbum inválido: '{original_name}' -> '{sanitized_name}'")
+                for error in errors:
+                    self.logger.warning(f"  - {error}")
             
-            # Asegurarse de que el nombre no esté vacío
-            if not album_name_from_path or album_name_from_path == ".":
-                album_name_from_path = "Uploads"  # Nombre genérico como último recurso
-                
-            # Eliminar cualquier prefijo de "root/" que pueda quedar
-            if album_name_from_path.startswith("root/"):
-                album_name_from_path = album_name_from_path[5:]
-            
-            # Agrupar por álbum
-            media_keys_by_album.setdefault(album_name_from_path, []).append(media_key)
-        
-        # Crear los álbumes en orden jerárquico (padres antes que hijos)
-        for album_name_from_path in sorted(media_keys_by_album.keys(), key=lambda x: x.count("/")):
-            self.logger.info(f"Creando álbum AUTO: {album_name_from_path}")
-            self.add_to_album(
-                media_keys_by_album[album_name_from_path],
-                album_name_from_path,
-                show_progress=show_progress,
-            )
+            sanitized_groups[sanitized_name] = media_keys
+            name_mapping[original_name] = sanitized_name
+
+        # Invertir mapeo para conocer álbum por media_key (usando nombres sanitizados)
+        inverse: dict[str, str] = {}
+        for name, keys in sanitized_groups.items():
+            for key in keys:
+                inverse[key] = name
+
+        # Persistir carpeta→álbum para mantener consistencia con archivos añadidos posteriormente
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            with Storage(self.db_path) as storage:
+                for file_path, media_key in results.items():
+                    folder = Path(file_path).parent.resolve()
+                    album = inverse.get(media_key)
+                    if album:
+                        storage.set_album_mapping(folder, album)
+                        self.logger.debug(f"Mapeado carpeta→álbum: '{folder}' → '{album}'")
+        except Exception as e:
+            self.logger.warning(f"No se pudo persistir mapeos de álbum: {e}")
+
+        # Crear álbumes en orden jerárquico (padres antes que hijos) usando nombres sanitizados
+        for name in sorted(sanitized_groups.keys(), key=lambda x: x.count("/")):
+            self.logger.info(f"Creando/actualizando álbum: {name} con {len(sanitized_groups[name])} elementos")
+            self.add_to_album(sanitized_groups[name], name, show_progress=show_progress)
 
     def _filter_files(self, expression: str, filter_exclude: bool, filter_regex: bool, filter_ignore_case: bool, filter_path: bool, paths: list[Path]) -> list[Path]:
         """
@@ -333,6 +337,9 @@ class Client:
         filter_regex: bool = False,
         filter_ignore_case: bool = False,
         filter_path: bool = False,
+        resume_session: str | None = None,
+        resume: bool = False,
+        restart: bool = False,
     ) -> dict[str, str]:
         """
         Upload one or more files or directories to Google Photos.
@@ -365,6 +372,8 @@ class Client:
             filter_regex: If True, treat the expression as a regular expression.
             filter_ignore_case: If True, perform case-insensitive matching.
             filter_path: If True, check for matches in the full path instead of just the filename.
+            resume_session: If provided, resume from a specific checkpoint session ID.
+                          If None, the system will automatically detect interrupted uploads.
 
         Returns:
             dict[str, str]: A dictionary mapping absolute file paths to their Google Photos media keys.
@@ -377,6 +386,129 @@ class Client:
             TypeError: If `target` is not a file path, directory path, or a squence of such paths.
             ValueError: If no valid media files are found to upload.
         """
+        # Inicializar gestores de checkpoint y reanudación
+        checkpoint_manager = CheckpointManager()
+        
+        # Configurar manejador de interrupciones
+        interruption_handler = InterruptionHandler(checkpoint_manager)
+        
+        resume_manager = ResumeManager(checkpoint_manager)
+        
+        # Determinar la ruta objetivo para detección de interrupciones
+        target_path = str(target) if isinstance(target, (str, Path)) else str(list(target)[0] if target else "")
+        
+        # Verificar si hay subidas interrumpidas (controlado por flags)
+        resume_data = None
+        if restart:
+            # Forzar reinicio: ignorar checkpoints
+            self.logger.info("Reinicio forzado: ignorando checkpoints existentes")
+        elif resume_session:
+            # Reanudación manual con session ID específico
+            resume_data = resume_manager.prepare_resume_data(resume_session)
+            if not resume_data:
+                raise ValueError(f"No se pudo cargar la sesión de reanudación: {resume_session}")
+        elif resume:
+            # Reanudación automática sin interacción
+            interrupted_sessions = resume_manager.check_for_interrupted_uploads(target_path, album_name)
+            if interrupted_sessions:
+                # Elegir la sesión más reciente
+                last_updated_map = {}
+                for sid in interrupted_sessions:
+                    cp = checkpoint_manager.load_checkpoint(sid)
+                    if cp:
+                        last_updated_map[sid] = cp.last_updated
+                selected_session = max(last_updated_map, key=last_updated_map.get) if last_updated_map else interrupted_sessions[0]
+                self.logger.info(f"Reanudando automáticamente sesión: {selected_session}")
+                resume_data = resume_manager.prepare_resume_data(selected_session)
+                if not resume_data:
+                    self.logger.error(f"Error al preparar datos de reanudación para: {selected_session}")
+                    return {}
+        else:
+            # Detección automática con interacción (modo por defecto)
+            interrupted_sessions = resume_manager.check_for_interrupted_uploads(target_path, album_name)
+            
+            if interrupted_sessions:
+                resume_manager.display_interrupted_uploads(interrupted_sessions)
+                action, selected_session = resume_manager.prompt_user_action(interrupted_sessions)
+                
+                if action == 'cancel':
+                    return {}
+                elif action == 'resume' and selected_session:
+                    resume_data = resume_manager.prepare_resume_data(selected_session)
+                    if not resume_data:
+                        self.logger.error(f"Error al preparar datos de reanudación para: {selected_session}")
+                        return {}
+                # Si action == 'restart', continuar con el flujo normal
+        
+        # Si hay datos de reanudación, validar consistencia
+        if resume_data:
+            current_params = {
+                'album_name': album_name,
+                'use_quota': use_quota,
+                'saver': saver,
+                'threads': threads,
+                'force_upload': force_upload,
+                'delete_from_host': delete_from_host
+            }
+            
+            # En modo CLI (--resume o --resume-session), no interactuar
+            non_interactive_mode = bool(resume or resume_session)
+            if not resume_manager.validate_resume_consistency(
+                resume_data,
+                current_params,
+                non_interactive=non_interactive_mode,
+                continue_on_inconsistency=False,
+            ):
+                self.logger.error("Parámetros inconsistentes, cancelando reanudación")
+                return {}
+            
+            resume_manager.show_resume_summary(resume_data)
+            # Registrar intento de reanudación en logs mejorados
+            try:
+                checkpoint_logger.log_resume_attempt(resume_data['session_id'], action='resume', user_choice='cli' if non_interactive_mode else 'interactive')
+            except Exception:
+                pass
+            
+            # Usar datos del checkpoint para la reanudación
+            path_hash_pairs = {f: b'' for f in resume_data['pending_files']}  # Hash se calculará después
+            checkpoint_manager.current_checkpoint = resume_data['checkpoint']
+            
+            # Crear mapeo de archivos a álbumes desde el checkpoint
+            file_album_mapping = resume_data['checkpoint'].file_album_mapping or {}
+        else:
+            # Flujo normal: procesar target input
+            path_hash_pairs = self._handle_target_input(
+                target,
+                recursive,
+                filter_exp,
+                filter_exclude,
+                filter_regex,
+                filter_ignore_case,
+                filter_path,
+            )
+        
+        # Registrar callback de emergencia para guardar checkpoint en interrupciones
+        def _save_on_interrupt():
+            try:
+                interruption_handler.emergency_save()
+            except Exception:
+                pass
+        interruption_handler.add_cleanup_callback(_save_on_interrupt)
+
+        # Crear mapeo de archivos a álbumes si se especifica album_name
+        file_album_mapping: dict[Path, str] = {}
+        if album_name:
+                if album_name.startswith("AUTO"):
+                    # Usar compute_album_groups de forma previa con placeholders para derivar nombre de álbum por archivo
+                    placeholder_results = {str(p): str(p) for p in path_hash_pairs.keys()}
+                    groups = utils.compute_album_groups(placeholder_results, album_name)
+                    for album, file_list in groups.items():
+                        for file_path_str in file_list:
+                            file_album_mapping[Path(file_path_str)] = album
+                else:
+                    for file_path in path_hash_pairs.keys():
+                        file_album_mapping[file_path] = album_name
+
         path_hash_pairs = self._handle_target_input(
             target,
             recursive,
@@ -387,17 +519,37 @@ class Client:
             filter_path,
         )
 
-        results = self._upload_concurrently(
+        # Crear mapeo de archivos a álbumes si se especifica album_name
+        file_album_mapping: dict[Path, str] = {}
+        if album_name:
+            if album_name.startswith("AUTO"):
+                # Usar compute_album_groups de forma previa con placeholders para derivar nombre de álbum por archivo
+                placeholder_results = {str(p): str(p) for p in path_hash_pairs.keys()}
+                groups = utils.compute_album_groups(placeholder_results, album_name)
+                for album, file_list in groups.items():
+                    for file_path_str in file_list:
+                        file_album_mapping[Path(file_path_str)] = album
+            else:
+                for file_path in path_hash_pairs.keys():
+                    file_album_mapping[file_path] = album_name
+
+        # Inicializar estado de álbumes para adición inmediata
+        self._albums_state = {}
+
+        results = self._upload_persistently(
             path_hash_pairs,
             threads=threads,
             show_progress=show_progress,
             force_upload=force_upload,
             use_quota=use_quota,
             saver=saver,
+            file_album_mapping=file_album_mapping,
+            checkpoint_manager=checkpoint_manager,
+            interruption_handler=interruption_handler,
+            album_name=album_name,
         )
 
-        if album_name:
-            self._handle_album_creation(results, album_name, show_progress)
+        # La adición al álbum ya ocurre inmediatamente durante la subida
 
         if delete_from_host:
             for file_path, _ in results.items():
@@ -514,81 +666,362 @@ class Client:
         return media_files
 
     def _calculate_hash(self, file_path: Path, progress: Progress) -> tuple[Path, bytes]:
+        # Verificar si el hash está en cache
+        cached_hash = self.metadata_cache.get_cached_hash(file_path)
+        if cached_hash:
+            self.logger.debug(f"Hash cacheado encontrado para: {file_path.name}")
+            return file_path, bytes.fromhex(cached_hash)
+        
+        # Calcular hash si no está en cache
         hash_calc_progress_id = progress.add_task(description="Calculating hash")
         try:
             hash_bytes, _ = calculate_sha1_hash(file_path, progress, hash_calc_progress_id)
+            # Cachear el hash calculado
+            hash_hex = hash_bytes.hex()
+            self.metadata_cache.cache_file_metadata(file_path, hash_hex)
+            self.logger.debug(f"Hash calculado y cacheado para: {file_path.name}")
             return file_path, hash_bytes
         finally:
             progress.update(hash_calc_progress_id, visible=False)
 
-    def _upload_concurrently(self, path_hash_pairs: Mapping[Path, bytes | str], threads: int, show_progress: bool, force_upload: bool, use_quota: bool, saver: bool) -> dict[str, str]:
+    def _upload_file_with_retry(self, file_path: Path, hash_value: bytes | str, progress: Progress, force_upload: bool, use_quota: bool, saver: bool, detailed_tracker: DetailedProgressTracker | None = None) -> dict[str, str]:
+        """Sube un archivo con reintentos y backoff exponencial con jitter.
+        Clasifica errores permanentes para no reintentar inútilmente.
         """
-        Upload files concurrently to Google Photos.
-
-        Args:
-            path_hash_pairs: Mapping of file paths to their SHA-1 hashes.
-            threads: Number of concurrent upload threads.
-            show_progress: Whether to display progress in console.
-            force_upload: Upload even if file exists in Google Photos.
-            use_quota: Count uploads against storage quota.
-            saver: Upload in storage saver quality.
-
-        Returns:
-            dict[str, str]: Dictionary mapping file paths to media keys.
-
-        Note:
-            Failed uploads are logged but don't stop the overall process.
+        max_attempts = 10
+        base_delay = 1.0  # segundos
+        max_delay = 30.0
+        last_error: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = self._upload_file(file_path, hash_value, progress, force_upload, use_quota, saver, detailed_tracker)
+                # Éxito: cache y retorno
+                for fp, mk in result.items():
+                    self.metadata_cache.update_upload_status(Path(fp), "success", media_key=mk)
+                    # Actualizar progreso detallado si está disponible
+                    if detailed_tracker:
+                        detailed_tracker.update_file_progress(file_path, 100.0)
+                return result
+            except Exception as e:
+                last_error = e
+                # Registro detallado del intento
+                self.logger.warning(f"Intento {attempt}/{max_attempts} fallido para {file_path}: {e}")
+                # Si es error permanente no reintentamos
+                if self._is_permanent_error(e):
+                    self.metadata_cache.update_upload_status(file_path, "failed")
+                    self.logger.error(f"Error permanente para {file_path}: {e}")
+                    raise e
+                # Backoff exponencial con jitter
+                if attempt < max_attempts:
+                    delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+                    jitter = random.uniform(0, delay * 0.25)
+                    wait_time = delay + jitter
+                    self.logger.info(f"Reintentando {file_path} tras {wait_time:.2f}s (backoff)")
+                    time.sleep(wait_time)
+                else:
+                    break
+        # Agotar reintentos: marcar y propagar último error
+        self.metadata_cache.update_upload_status(file_path, "failed")
+        self.logger.error(f"Fallo definitivo tras {max_attempts} intentos para {file_path}")
+        assert last_error is not None
+        raise last_error
+    def _add_immediate_to_album(self, file_path: Path, media_key: str, target_album: str) -> None:
+        """Añade inmediatamente el media a un álbum. Crea el álbum si no existe.
+        Maneja límite de elementos por álbum creando sufijos (Album, Album 2, ...).
         """
-        uploaded_files = {}
-        overall_progress = Progress(
-            TextColumn("[bold yellow]Files processed:"),
-            SpinnerColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            TextColumn("{task.description}"),
-        )
-        file_progress = Progress(
-            DownloadColumn(),
-            TaskProgressColumn(),
-            TimeRemainingColumn(),
-            TransferSpeedColumn(),
-            TextColumn("{task.description}"),
-        )
-        upload_error_count = 0
-        progress_group = Group(
-            file_progress,
-            overall_progress,
-        )
+        base_name = album_validator.sanitize_album_name(utils.sanitize_album_name(target_album))
+        state = self._albums_state.get(base_name)
+        album_limit = 20000  # límite aproximado por álbum
+        if not state:
+            # Crear álbum con el primer elemento
+            created_key = self.api.create_album(base_name, [media_key])
+            self._albums_state[base_name] = {
+                "album_key": created_key,
+                "current_album_name": base_name,
+                "count": 1,
+                "suffix_index": 1,
+            }
+            self.logger.info(f"Creado álbum '{base_name}' y agregado {file_path}")
+        else:
+            count = int(state.get("count", 0))
+            if count >= album_limit:
+                # Abrir nuevo álbum con sufijo
+                suffix_index = int(state.get("suffix_index", 1)) + 1
+                new_name = f"{base_name} {suffix_index}"
+                created_key = self.api.create_album(new_name, [media_key])
+                state.update({
+                    "album_key": created_key,
+                    "current_album_name": new_name,
+                    "count": 1,
+                    "suffix_index": suffix_index,
+                })
+                self.logger.info(f"Límite alcanzado. Creado álbum '{new_name}' y agregado {file_path}")
+            else:
+                self.api.add_media_to_album(state["album_key"], [media_key])
+                state["count"] = count + 1
+                self.logger.info(f"Agregado {file_path} al álbum '{state['current_album_name']}'")
+        # Persistir asociación del directorio (mejora opcional para futuras rondas)
+        try:
+            self.storage.set_album_mapping(str(file_path.parent.resolve()), base_name)
+        except Exception:
+            pass
+    def _upload_concurrently(
+        self,
+        path_hash_pairs: Mapping[Path, bytes | str],
+        threads: int,
+        show_progress: bool,
+        force_upload: bool,
+        use_quota: bool,
+        saver: bool,
+        file_album_mapping: dict[Path, str] | None = None,
+        detailed_tracker: DetailedProgressTracker | None = None,
+    ) -> tuple[dict[str, str], list[Path], list[Path]]:
+        """Subida concurrente de archivos.
+        Retorna (resultados, fallos_temporales, fallos_permanentes).
+        Añade a álbum inmediatamente en cada subida exitosa.
+        """
+        results: dict[str, str] = {}
+        temporary_failures: list[Path] = []
+        permanent_failures: list[Path] = []
 
-        context = (show_progress and Live(progress_group)) or nullcontext()
+        # Inicializar progress como None para evitar UnboundLocalError
+        progress = None
 
-        overall_task_id = overall_progress.add_task("Errors: 0", total=len(path_hash_pairs.keys()), visible=show_progress)
-        with context:
+        # Usar el sistema de progreso detallado si está disponible
+        if detailed_tracker and show_progress:
+            progress_group = detailed_tracker.get_progress_layout()
+        else:
+            # Progreso tradicional como fallback
+            progress = Progress(
+                SpinnerColumn(),
+                TextColumn("[bold blue]Subiendo"),
+                MofNCompleteColumn(),
+                TaskProgressColumn(),
+                DownloadColumn(),
+                TransferSpeedColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+            ) if show_progress else None
+
+            # Progreso por álbum si se proporciona mapeo
+            album_tracker = AlbumProgressTracker(show_progress=True) if (show_progress and file_album_mapping) else None
+            if album_tracker:
+                album_tracker.initialize_albums(file_album_mapping)
+
+            progress_group = album_tracker.get_progress_group() if album_tracker else Group(progress if progress else Group())
+
+        main_task: TaskID | None = None
+        hash_task: TaskID | None = None
+        upload_task: TaskID | None = None
+
+        with Live(
+            progress_group,
+            refresh_per_second=10,
+            transient=True,
+        ) if show_progress else nullcontext():
+            # Configurar progreso tradicional si no hay sistema detallado
+            if not detailed_tracker and progress:
+                main_task = progress.add_task("Preparando archivos", total=len(path_hash_pairs))
+                hash_task = progress.add_task("Calculando hash", total=len(path_hash_pairs))
+                upload_task = progress.add_task("Subiendo", total=len(path_hash_pairs))
+            
+            # Usar Progress nulo si no hay interfaz de progreso visual
+            progress_ops = progress if progress is not None else NullProgress()
             with ThreadPoolExecutor(max_workers=threads) as executor:
-                futures = {
-                    executor.submit(
-                        self._upload_file, 
-                        path, 
-                        hash_value, 
-                        progress=file_progress, 
-                        force_upload=force_upload, 
-                        use_quota=use_quota, 
-                        saver=saver
-                    ): path 
-                    for path, hash_value in path_hash_pairs.items()
-                }
+                futures = {}
+                for file_path, hash_value in path_hash_pairs.items():
+                    # Marcar inicio de subida en el sistema detallado
+                    if detailed_tracker:
+                        detailed_tracker.start_file_upload(file_path)
+                    
+                    future = executor.submit(
+                        self._upload_file_with_retry,
+                        file_path,
+                        hash_value,
+                        progress_ops,
+                        force_upload,
+                        use_quota,
+                        saver,
+                        detailed_tracker,
+                    )
+                    futures[future] = file_path
+                
                 for future in as_completed(futures):
-                    file = futures[future]
+                    file_path = futures[future]
+                    if not detailed_tracker and progress and main_task is not None:
+                        progress.update(main_task, advance=1)
+                    
                     try:
-                        media_key_dict = future.result()
-                        uploaded_files.update(media_key_dict)
+                        result = future.result()
+                        for fp_str, media_key in result.items():
+                            results[fp_str] = media_key
+                            if not detailed_tracker and progress and upload_task is not None:
+                                progress.update(upload_task, advance=1)
+                            
+                            # Marcar éxito en el sistema detallado
+                            if detailed_tracker:
+                                detailed_tracker.complete_file_upload(file_path, success=True)
+                            
+                            # Añadir a álbum inmediatamente si corresponde
+                            if file_album_mapping and file_path in file_album_mapping:
+                                try:
+                                    self._add_immediate_to_album(file_path, media_key, file_album_mapping[file_path])
+                                    if not detailed_tracker and album_tracker:
+                                        album_tracker.update_file_progress(file_path, file_album_mapping[file_path], success=True)
+                                except Exception as add_err:
+                                    # La adición al álbum falló: clasificar para logging, pero no detener
+                                    if self._is_permanent_error(add_err):
+                                        self.logger.error(f"Error permanente al agregar a álbum: {add_err}")
+                                        if not detailed_tracker and album_tracker:
+                                            album_tracker.update_file_progress(file_path, file_album_mapping[file_path], success=False)
+                                    else:
+                                        self.logger.warning(f"Error temporal al agregar a álbum: {add_err}")
+                                        if not detailed_tracker and album_tracker:
+                                            album_tracker.update_file_progress(file_path, file_album_mapping[file_path], success=False)
                     except Exception as e:
-                        self.logger.error(f"Error uploading file {file}: {e}")
-                        upload_error_count += 1
-                        overall_progress.update(task_id=overall_task_id, description=f"[bold red] Errors: {upload_error_count}")
-                    finally:
-                        overall_progress.advance(overall_task_id)
-        return uploaded_files
+                        # Marcar fallo en el sistema detallado
+                        if detailed_tracker:
+                            detailed_tracker.complete_file_upload(file_path, success=False, error_message=str(e))
+                        
+                        # Clasificar tipo de fallo
+                        if self._is_permanent_error(e):
+                            permanent_failures.append(file_path)
+                            self.logger.error(f"Fallo permanente: {file_path} -> {e}")
+                            if not detailed_tracker and album_tracker and file_album_mapping and file_path in file_album_mapping:
+                                album_tracker.update_file_progress(file_path, file_album_mapping[file_path], success=False)
+                        else:
+                            temporary_failures.append(file_path)
+                            self.logger.warning(f"Fallo temporal: {file_path} -> {e}")
+                            if not detailed_tracker and album_tracker and file_album_mapping and file_path in file_album_mapping:
+                                album_tracker.update_file_progress(file_path, file_album_mapping[file_path], success=False)
+        return results, temporary_failures, permanent_failures
+    def _upload_persistently(
+        self,
+        path_hash_pairs: Mapping[Path, bytes | str],
+        threads: int,
+        show_progress: bool,
+        force_upload: bool,
+        use_quota: bool,
+        saver: bool,
+        file_album_mapping: dict[Path, str] | None = None,
+        checkpoint_manager: CheckpointManager | None = None,
+        interruption_handler: InterruptionHandler | None = None,
+        album_name: str | None = None,
+    ) -> dict[str, str]:
+        """Orquesta rondas de subida y reintento hasta completar todos los archivos no permanentes."""
+        remaining: dict[Path, bytes | str] = dict(path_hash_pairs)
+        all_results: dict[str, str] = {}
+        round_index = 0
+        start_time = time.time()
+        try:
+            total_size = sum(Path(fp).stat().st_size for fp in path_hash_pairs.keys())
+        except Exception:
+            total_size = 0
+        
+        # Crear sistema de progreso detallado si se requiere
+        detailed_tracker = None
+        if show_progress and file_album_mapping:
+            detailed_tracker = DetailedProgressTracker(show_progress=True, compact_mode=True)
+            detailed_tracker.initialize_files(file_album_mapping)
+        
+        # Inicializar checkpoint si se proporciona
+        if checkpoint_manager and not checkpoint_manager.current_checkpoint:
+            # Crear nuevo checkpoint para esta sesión
+            upload_params = {
+                'album_name': file_album_mapping.get(list(file_album_mapping.keys())[0]) if file_album_mapping else None,
+                'use_quota': use_quota,
+                'saver': saver,
+                'threads': threads,
+                'force_upload': force_upload
+            }
+            
+            target_path = str(list(path_hash_pairs.keys())[0].parent) if path_hash_pairs else ""
+            checkpoint_manager.create_checkpoint(
+                target_path=target_path,
+                album_name=album_name,
+                upload_params=upload_params,
+                file_paths=list(path_hash_pairs.keys())
+            )
+        
+        while remaining:
+            round_index += 1
+            self.logger.info(f"Ronda {round_index}: {len(remaining)} archivos por subir")
+            results, temp_failures, perm_failures = self._upload_concurrently(
+                remaining,
+                threads=threads,
+                show_progress=show_progress,
+                force_upload=force_upload,
+                use_quota=use_quota,
+                saver=saver,
+                file_album_mapping=file_album_mapping,
+                detailed_tracker=detailed_tracker,
+            )
+            all_results.update(results)
+            
+            # Actualizar checkpoint con resultados de esta ronda
+            if checkpoint_manager:
+                for file_path, media_key in results.items():
+                    checkpoint_manager.update_file_progress(Path(file_path), 'completed', media_key)
+                
+                for failed_file in perm_failures:
+                    checkpoint_manager.update_file_progress(failed_file, 'failed', error="Fallo permanente")
+            
+            # Guardar checkpoint de progreso mediante manejador de interrupciones
+            if interruption_handler:
+                try:
+                    round_completed = [Path(fp) for fp in results.keys()]
+                    round_failed = list(set(temp_failures + perm_failures))
+                    interruption_handler.create_progress_checkpoint(round_completed, round_failed)
+                except Exception:
+                    pass
+            
+            # Remover éxitos y fallos permanentes del conjunto restante
+            succeeded_paths = {Path(fp) for fp in results.keys()}
+            remaining = {fp: hv for fp, hv in remaining.items() if fp not in succeeded_paths and fp not in set(perm_failures)}
+
+            # Feedback claro de ronda
+            self.logger.info(
+                f"Ronda {round_index} resumen: éxitos={len(results)}, temporales={len(temp_failures)}, permanentes={len(perm_failures)}"
+            )
+
+            if not temp_failures:
+                break
+            
+            # Backoff entre rondas para aliviar presión al API
+            delay = min(60.0, 2.0 * (2 ** (round_index - 1)))
+            jitter = random.uniform(0, delay * 0.25)
+            wait_time = delay + jitter
+            self.logger.info(f"Esperando {wait_time:.2f}s antes de la siguiente ronda de reintentos")
+            time.sleep(wait_time)
+            
+            # Preparar siguiente ronda con sólo temporales
+            remaining = {fp: path_hash_pairs[fp] for fp in temp_failures if fp in path_hash_pairs}
+        
+        # Mostrar estadísticas finales si hay progreso detallado
+        if detailed_tracker:
+            detailed_tracker.log_final_summary()
+        
+        # Finalizar checkpoint si se completó la subida
+        if checkpoint_manager:
+            if not remaining:  # Todos los archivos procesados
+                checkpoint_manager.mark_upload_complete()
+                self.logger.info("✅ Subida completada - Checkpoint marcado como finalizado")
+            else:
+                self.logger.info(f"⏸️  Subida pausada - {len(remaining)} archivos pendientes guardados en checkpoint")
+        
+        # Logging mejorado de resumen de subida
+        try:
+            session_id = checkpoint_manager.current_checkpoint.session_id if checkpoint_manager and checkpoint_manager.current_checkpoint else ""
+            total_files = len(path_hash_pairs)
+            completed = len(all_results)
+            failed = max(0, total_files - completed - len(remaining))
+            skipped = 0
+            total_time = time.time() - start_time
+            checkpoint_logger.log_upload_summary(session_id, total_files, completed, failed, skipped, total_time, total_size)
+        except Exception:
+            pass
+        
+        return all_results
 
     def move_to_trash(self, sha1_hashes: str | bytes | Sequence[str | bytes]) -> dict:
         """
