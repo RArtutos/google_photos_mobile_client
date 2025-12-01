@@ -673,6 +673,24 @@ class Client:
         finally:
             progress.update(hash_calc_progress_id, visible=False)
 
+    def _is_permanent_error(self, error: Exception) -> bool:
+        """Determina si un error es permanente y no debe ser reintentado."""
+        if isinstance(error, requests.exceptions.HTTPError):
+            if error.response is not None:
+                status_code = error.response.status_code
+                # 429 (Too Many Requests) y 5xx son temporales
+                if status_code == 429 or 500 <= status_code < 600:
+                    return False
+                # 401/403 requieren intervención (auth), 400 es error de petición
+                if status_code in (400, 401, 403, 404):
+                    return True
+        
+        if isinstance(error, UploadRejected):
+            return True
+            
+        # Errores de conexión, timeouts, etc., se asumen temporales
+        return False
+
     def _upload_file_with_retry(self, file_path: Path, hash_value: bytes | str, progress: Progress, force_upload: bool, use_quota: bool, saver: bool, detailed_tracker: DetailedProgressTracker | None = None) -> dict[str, str]:
         """Sube un archivo con reintentos y backoff exponencial con jitter.
         Clasifica errores permanentes para no reintentar inútilmente.
