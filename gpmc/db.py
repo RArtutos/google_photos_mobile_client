@@ -76,9 +76,16 @@ class Storage:
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS album_mappings (
             folder_path TEXT PRIMARY KEY,
-            album_name TEXT
+            album_name TEXT,
+            album_id TEXT
         )
         """)
+        
+        # Migración simple para añadir columna si no existe
+        try:
+            self.conn.execute("ALTER TABLE album_mappings ADD COLUMN album_id TEXT")
+        except sqlite3.OperationalError:
+            pass
         
         self.conn.execute("""
         INSERT OR IGNORE INTO state (id, state_token, page_token, init_complete)
@@ -179,28 +186,32 @@ class Storage:
         """Close the database connection."""
         self.conn.close()
 
-    def get_album_mapping(self, folder_path: str | Path) -> str | None:
-        """Get album name mapped to a folder path, if any."""
+    def get_album_mapping(self, folder_path: str | Path) -> tuple[str, str | None] | None:
+        """Get album name and id mapped to a folder path, if any.
+        Returns (album_name, album_id) or None.
+        """
         cursor = self.conn.execute(
-            "SELECT album_name FROM album_mappings WHERE folder_path = ?",
+            "SELECT album_name, album_id FROM album_mappings WHERE folder_path = ?",
             (str(folder_path),),
         )
         row = cursor.fetchone()
-        return row[0] if row else None
+        return (row[0], row[1]) if row else None
 
-    def set_album_mapping(self, folder_path: str | Path, album_name: str) -> None:
-        """Persist mapping from folder path to album name."""
+    def set_album_mapping(self, folder_path: str | Path, album_name: str, album_id: str | None = None) -> None:
+        """Persist mapping from folder path to album name and id."""
         with self.conn:
             self.conn.execute(
                 """
-                INSERT INTO album_mappings (folder_path, album_name)
-                VALUES (?, ?)
-                ON CONFLICT(folder_path) DO UPDATE SET album_name = excluded.album_name
+                INSERT INTO album_mappings (folder_path, album_name, album_id)
+                VALUES (?, ?, ?)
+                ON CONFLICT(folder_path) DO UPDATE SET 
+                    album_name = excluded.album_name,
+                    album_id = COALESCE(excluded.album_id, album_mappings.album_id)
                 """,
-                (str(folder_path), album_name),
+                (str(folder_path), album_name, album_id),
             )
 
-    def get_all_album_mappings(self) -> dict[str, str]:
-        """Return all folder→album mappings."""
-        cursor = self.conn.execute("SELECT folder_path, album_name FROM album_mappings")
-        return {folder: album for folder, album in cursor.fetchall()}
+    def get_all_album_mappings(self) -> dict[str, tuple[str, str | None]]:
+        """Return all folder mappings as {folder: (album_name, album_id)}."""
+        cursor = self.conn.execute("SELECT folder_path, album_name, album_id FROM album_mappings")
+        return {folder: (album, album_id) for folder, album, album_id in cursor.fetchall()}

@@ -502,6 +502,17 @@ class Client:
                 else:
                     for file_path in path_hash_pairs.keys():
                         file_album_mapping[file_path] = album_name
+            else:
+                # Intentar recuperar mapeo de álbumes previos desde la base de datos
+                try:
+                    with Storage(self.db_path) as storage:
+                        for file_path in path_hash_pairs.keys():
+                            folder = file_path.parent.resolve()
+                            if saved_album_info := storage.get_album_mapping(folder):
+                                # saved_album_info es (nombre, id)
+                                file_album_mapping[file_path] = saved_album_info[0]
+                except Exception as e:
+                    self.logger.warning(f"No se pudo recuperar mapeo de álbumes: {e}")
         
         # Registrar callback de emergencia para guardar checkpoint en interrupciones
         def _save_on_interrupt():
@@ -711,15 +722,36 @@ class Client:
         state = self._albums_state.get(base_name)
         album_limit = 20000  # límite aproximado por álbum
         if not state:
-            # Crear álbum con el primer elemento
-            created_key = self.api.create_album(base_name, [media_key])
-            self._albums_state[base_name] = {
-                "album_key": created_key,
-                "current_album_name": base_name,
-                "count": 1,
-                "suffix_index": 1,
-            }
-            self.logger.info(f"Creado álbum '{base_name}' y agregado {file_path}")
+            # Intentar recuperar ID de álbum existente para evitar duplicados
+            saved_id = None
+            try:
+                with Storage(self.db_path) as storage:
+                    mapping = storage.get_album_mapping(file_path.parent.resolve())
+                    if mapping and mapping[0] == base_name:
+                        saved_id = mapping[1]
+            except Exception:
+                pass
+
+            if saved_id:
+                # Reutilizar álbum existente
+                self._albums_state[base_name] = {
+                    "album_key": saved_id,
+                    "current_album_name": base_name,
+                    "count": 1,
+                    "suffix_index": 1,
+                }
+                self.api.add_media_to_album(saved_id, [media_key])
+                self.logger.info(f"Agregado {file_path} al álbum existente '{base_name}'")
+            else:
+                # Crear álbum con el primer elemento
+                created_key = self.api.create_album(base_name, [media_key])
+                self._albums_state[base_name] = {
+                    "album_key": created_key,
+                    "current_album_name": base_name,
+                    "count": 1,
+                    "suffix_index": 1,
+                }
+                self.logger.info(f"Creado álbum '{base_name}' y agregado {file_path}")
         else:
             count = int(state.get("count", 0))
             if count >= album_limit:
@@ -738,9 +770,12 @@ class Client:
                 self.api.add_media_to_album(state["album_key"], [media_key])
                 state["count"] = count + 1
                 self.logger.info(f"Agregado {file_path} al álbum '{state['current_album_name']}'")
-        # Persistir asociación del directorio (mejora opcional para futuras rondas)
+        
+        # Persistir asociación del directorio
         try:
-            self.storage.set_album_mapping(str(file_path.parent.resolve()), base_name)
+            with Storage(self.db_path) as storage:
+                current_key = self._albums_state[base_name]["album_key"]
+                storage.set_album_mapping(str(file_path.parent.resolve()), base_name, current_key)
         except Exception:
             pass
     def _upload_concurrently(
