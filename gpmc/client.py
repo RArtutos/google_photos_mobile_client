@@ -387,7 +387,9 @@ class Client:
             ValueError: If no valid media files are found to upload.
         """
         # Inicializar gestores de checkpoint y reanudación
-        checkpoint_manager = CheckpointManager()
+        # Usar directorio específico del usuario para los checkpoints
+        checkpoint_dir = self.cache_dir / "checkpoints"
+        checkpoint_manager = CheckpointManager(checkpoint_dir=checkpoint_dir)
         
         # Configurar manejador de interrupciones
         interruption_handler = InterruptionHandler(checkpoint_manager)
@@ -942,6 +944,39 @@ class Client:
                 upload_params=upload_params,
                 file_paths=list(path_hash_pairs.keys())
             )
+
+            # Optimización: Verificar historial local para saltar archivos ya subidos (Deduplicación local)
+            self.logger.info("Verificando historial local para archivos ya subidos...")
+            history_map = checkpoint_manager.get_history_map()
+            skipped_count = 0
+            
+            for file_path in list(remaining.keys()):
+                abs_path = str(file_path.absolute())
+                if abs_path in history_map:
+                    media_key, size = history_map[abs_path]
+                    try:
+                        current_size = file_path.stat().st_size
+                        # Verificar tamaño para mayor seguridad (evitar falsos positivos si el archivo cambió)
+                        if current_size == size:
+                            # Marcar como completado
+                            all_results[file_path.absolute().as_posix()] = media_key
+                            checkpoint_manager.update_file_progress(file_path, 'completed', media_key=media_key)
+                            
+                            # Añadir al álbum si es necesario (ya que saltamos la subida)
+                            if file_album_mapping and file_path in file_album_mapping:
+                                try:
+                                    self._add_immediate_to_album(file_path, media_key, file_album_mapping[file_path])
+                                except Exception as e:
+                                    self.logger.warning(f"Error añadiendo archivo histórico al álbum: {e}")
+
+                            del remaining[file_path]
+                            skipped_count += 1
+                    except Exception:
+                        # Si hay error leyendo archivo (borrado, etc), dejar que el proceso normal lo maneje
+                        pass
+                        
+            if skipped_count > 0:
+                self.logger.info(f"✅ Saltados {skipped_count} archivos encontrados en historial local (ya subidos)")
         
         while remaining:
             round_index += 1

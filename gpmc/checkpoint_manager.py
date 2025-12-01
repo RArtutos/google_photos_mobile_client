@@ -367,6 +367,32 @@ class CheckpointManager:
                           self.active_checkpoint.failed_files)
         return total_processed >= self.active_checkpoint.total_files
     
+    def mark_upload_complete(self):
+        """
+        Marcar la sesión actual como completada y archivar el checkpoint.
+        Se renombra a history_*.json para mantener un registro permanente.
+        """
+        if not self.active_checkpoint or not self.checkpoint_file:
+            return
+            
+        try:
+            # Actualizar estado interno si es necesario
+            self.active_checkpoint.last_updated = datetime.now(timezone.utc).isoformat()
+            self._save_checkpoint()
+            
+            # Renombrar a historial
+            history_file = self.checkpoint_dir / f"history_{self.active_checkpoint.session_id}.json"
+            if self.checkpoint_file.exists():
+                self.checkpoint_file.rename(history_file)
+                self.logger.info(f"Sesión completada y archivada en: {history_file.name}")
+                
+            # Limpiar referencia activa
+            self.active_checkpoint = None
+            self.checkpoint_file = None
+            
+        except Exception as e:
+            self.logger.error(f"Error archivando sesión completada: {e}")
+
     def cleanup_checkpoint(self, session_id: Optional[str] = None):
         """
         Limpiar checkpoint completado.
@@ -443,3 +469,39 @@ class CheckpointManager:
         # Ordenar por fecha de actualización (más reciente primero)
         checkpoints.sort(key=lambda x: x['last_updated'], reverse=True)
         return checkpoints
+
+    def get_history_map(self) -> Dict[str, tuple[str, int]]:
+        """
+        Obtener mapa de archivos subidos exitosamente en sesiones pasadas.
+        
+        Returns:
+            Dict[path_absoluto, (media_key, file_size)]
+        """
+        history_map = {}
+        
+        # Buscar en todos los archivos de historial
+        for history_file in self.checkpoint_dir.glob("history_*.json"):
+            try:
+                with open(history_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # Extraer archivos completados
+                if 'files' in data:
+                    for path, info in data['files'].items():
+                        # Verificar si está completado y tiene media_key
+                        status = info.get('status')
+                        media_key = info.get('media_key')
+                        size = info.get('file_size', 0)
+                        
+                        # Aceptar tanto string como enum value
+                        is_completed = (status == 'completed' or 
+                                      status == FileStatus.COMPLETED.value)
+                        
+                        if is_completed and media_key:
+                            history_map[path] = (media_key, size)
+                            
+            except Exception as e:
+                self.logger.warning(f"Error leyendo historial {history_file}: {e}")
+                continue
+                
+        return history_map
