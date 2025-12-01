@@ -488,18 +488,10 @@ class Client:
                 filter_ignore_case,
                 filter_path,
             )
-        
-        # Registrar callback de emergencia para guardar checkpoint en interrupciones
-        def _save_on_interrupt():
-            try:
-                interruption_handler.emergency_save()
-            except Exception:
-                pass
-        interruption_handler.add_cleanup_callback(_save_on_interrupt)
-
-        # Crear mapeo de archivos a álbumes si se especifica album_name
-        file_album_mapping: dict[Path, str] = {}
-        if album_name:
+            
+            # Crear mapeo de archivos a álbumes si se especifica album_name
+            file_album_mapping = {}
+            if album_name:
                 if album_name.startswith("AUTO"):
                     # Usar compute_album_groups de forma previa con placeholders para derivar nombre de álbum por archivo
                     placeholder_results = {str(p): str(p) for p in path_hash_pairs.keys()}
@@ -510,30 +502,14 @@ class Client:
                 else:
                     for file_path in path_hash_pairs.keys():
                         file_album_mapping[file_path] = album_name
-
-        path_hash_pairs = self._handle_target_input(
-            target,
-            recursive,
-            filter_exp,
-            filter_exclude,
-            filter_regex,
-            filter_ignore_case,
-            filter_path,
-        )
-
-        # Crear mapeo de archivos a álbumes si se especifica album_name
-        file_album_mapping: dict[Path, str] = {}
-        if album_name:
-            if album_name.startswith("AUTO"):
-                # Usar compute_album_groups de forma previa con placeholders para derivar nombre de álbum por archivo
-                placeholder_results = {str(p): str(p) for p in path_hash_pairs.keys()}
-                groups = utils.compute_album_groups(placeholder_results, album_name)
-                for album, file_list in groups.items():
-                    for file_path_str in file_list:
-                        file_album_mapping[Path(file_path_str)] = album
-            else:
-                for file_path in path_hash_pairs.keys():
-                    file_album_mapping[file_path] = album_name
+        
+        # Registrar callback de emergencia para guardar checkpoint en interrupciones
+        def _save_on_interrupt():
+            try:
+                interruption_handler.emergency_save()
+            except Exception:
+                pass
+        interruption_handler.add_cleanup_callback(_save_on_interrupt)
 
         # Inicializar estado de álbumes para adición inmediata
         self._albums_state = {}
