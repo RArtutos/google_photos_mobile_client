@@ -21,7 +21,8 @@ class AlbumNameValidator:
     MAX_LENGTH = 500
     
     # Caracteres prohibidos (basado en las restricciones comunes de Google Photos)
-    FORBIDDEN_CHARS = ['<', '>', ':', '"', '|', '?', '*', '\\', '/']
+    # Permitimos '/' para que se puedan usar rutas como nombres de álbumes
+    FORBIDDEN_CHARS = ['<', '>', ':', '"', '|', '?', '*', '\\']
     
     # Nombres reservados del sistema
     RESERVED_NAMES = [

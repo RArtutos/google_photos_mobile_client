@@ -175,6 +175,8 @@ class Client:
                 progress.update(task_id=file_progress_id, description=f"Checking: {file_path.name}")
                 if remote_media_key := self.api.find_remote_media_by_hash(hash_bytes):
                     return {file_path.absolute().as_posix(): remote_media_key}
+            else:
+                self.logger.warning(f"Forzando subida: se ignorará verificación de duplicados para {file_path.name}")
 
             upload_token = self.api.get_upload_token(hash_b64, file_size)
             progress.reset(task_id=file_progress_id)
@@ -489,30 +491,38 @@ class Client:
                 filter_path,
             )
             
-            # Crear mapeo de archivos a álbumes si se especifica album_name
+            # Crear mapeo de archivos a álbumes
             file_album_mapping = {}
+            
+            # 1. Intentar recuperar mapeo de álbumes previos desde la base de datos (Prioridad 1: Persistencia de usuario)
+            # Esto asegura que si ya existe un álbum asignado a una carpeta, se respete.
+            try:
+                with Storage(self.db_path) as storage:
+                    for file_path in path_hash_pairs.keys():
+                        folder = file_path.parent.resolve()
+                        if saved_album_info := storage.get_album_mapping(folder):
+                            # saved_album_info es (nombre, id)
+                            file_album_mapping[file_path] = saved_album_info[0]
+            except Exception as e:
+                self.logger.warning(f"No se pudo recuperar mapeo de álbumes de DB: {e}")
+
+            # 2. Si se especifica album_name, aplicar lógica
             if album_name:
                 if album_name.startswith("AUTO"):
-                    # Usar compute_album_groups de forma previa con placeholders para derivar nombre de álbum por archivo
-                    placeholder_results = {str(p): str(p) for p in path_hash_pairs.keys()}
-                    groups = utils.compute_album_groups(placeholder_results, album_name)
-                    for album, file_list in groups.items():
-                        for file_path_str in file_list:
-                            file_album_mapping[Path(file_path_str)] = album
+                    # AUTO: Sólo llenar huecos, respetar DB existente
+                    pending_files = {p: h for p, h in path_hash_pairs.items() if p not in file_album_mapping}
+                    
+                    if pending_files:
+                        placeholder_results = {str(p): str(p) for p in pending_files.keys()}
+                        groups = utils.compute_album_groups(placeholder_results, album_name)
+                        for album, file_list in groups.items():
+                            for file_path_str in file_list:
+                                file_album_mapping[Path(file_path_str)] = album
                 else:
+                    # Nombre Fijo: El usuario fuerza este álbum para TODOS los archivos seleccionados
+                    # Sobrescribe lo que haya en DB porque es una orden explícita de "subir AQUI"
                     for file_path in path_hash_pairs.keys():
                         file_album_mapping[file_path] = album_name
-            else:
-                # Intentar recuperar mapeo de álbumes previos desde la base de datos
-                try:
-                    with Storage(self.db_path) as storage:
-                        for file_path in path_hash_pairs.keys():
-                            folder = file_path.parent.resolve()
-                            if saved_album_info := storage.get_album_mapping(folder):
-                                # saved_album_info es (nombre, id)
-                                file_album_mapping[file_path] = saved_album_info[0]
-                except Exception as e:
-                    self.logger.warning(f"No se pudo recuperar mapeo de álbumes: {e}")
         
         # Registrar callback de emergencia para guardar checkpoint en interrupciones
         def _save_on_interrupt():
@@ -711,20 +721,37 @@ class Client:
                 return result
             except Exception as e:
                 last_error = e
-                # Registro detallado del intento
-                self.logger.warning(f"Intento {attempt}/{max_attempts} fallido para {file_path}: {e}")
+                
+                # Manejo específico para Rate Limit (429)
+                is_rate_limit = False
+                if isinstance(e, requests.exceptions.HTTPError) and e.response is not None:
+                    if e.response.status_code == 429:
+                        is_rate_limit = True
+                        self.logger.warning(f"⚠️  Rate Limit (429) detectado para {file_path}. Pausando 60s para enfriar...")
+                        time.sleep(60)
+                        # No incrementamos el contador de 'permanent' para esto, es temporal
+                        
+                # Registro detallado del intento si no fue rate limit (que ya se logueó)
+                if not is_rate_limit:
+                    self.logger.warning(f"Intento {attempt}/{max_attempts} fallido para {file_path}: {e}")
+
                 # Si es error permanente no reintentamos
                 if self._is_permanent_error(e):
                     self.metadata_cache.update_upload_status(file_path, "failed")
                     self.logger.error(f"Error permanente para {file_path}: {e}")
                     raise e
-                # Backoff exponencial con jitter
+                
+                # Backoff exponencial con jitter (si no fue rate limit, o incluso si lo fue para extra seguridad)
                 if attempt < max_attempts:
-                    delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
-                    jitter = random.uniform(0, delay * 0.25)
-                    wait_time = delay + jitter
-                    self.logger.info(f"Reintentando {file_path} tras {wait_time:.2f}s (backoff)")
-                    time.sleep(wait_time)
+                    # Si fue rate limit, ya esperamos 60s. Si no, usamos backoff normal.
+                    if not is_rate_limit:
+                        delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+                        jitter = random.uniform(0, delay * 0.25)
+                        wait_time = delay + jitter
+                        self.logger.info(f"Reintentando {file_path} tras {wait_time:.2f}s (backoff)")
+                        time.sleep(wait_time)
+                    else:
+                         self.logger.info(f"Reintentando {file_path} tras pausa de rate limit")
                 else:
                     break
         # Agotar reintentos: marcar y propagar último error
@@ -806,6 +833,7 @@ class Client:
         saver: bool,
         file_album_mapping: dict[Path, str] | None = None,
         detailed_tracker: DetailedProgressTracker | None = None,
+        checkpoint_manager: CheckpointManager | None = None,
     ) -> tuple[dict[str, str], list[Path], list[Path]]:
         """Subida concurrente de archivos.
         Retorna (resultados, fallos_temporales, fallos_permanentes).
@@ -893,6 +921,10 @@ class Client:
                             if detailed_tracker:
                                 detailed_tracker.complete_file_upload(file_path, success=True)
                             
+                            # Actualizar checkpoint PERSISTENTE inmediatamente
+                            if checkpoint_manager:
+                                checkpoint_manager.update_file_progress(file_path, 'completed', media_key=media_key)
+
                             # Añadir a álbum inmediatamente si corresponde
                             if file_album_mapping and file_path in file_album_mapping:
                                 try:
@@ -918,11 +950,19 @@ class Client:
                         if self._is_permanent_error(e):
                             permanent_failures.append(file_path)
                             self.logger.error(f"Fallo permanente: {file_path} -> {e}")
+                            
+                            # Actualizar checkpoint como fallido
+                            if checkpoint_manager:
+                                checkpoint_manager.update_file_progress(file_path, 'failed', error=str(e))
+
                             if not detailed_tracker and album_tracker and file_album_mapping and file_path in file_album_mapping:
                                 album_tracker.update_file_progress(file_path, file_album_mapping[file_path], success=False)
                         else:
                             temporary_failures.append(file_path)
                             self.logger.warning(f"Fallo temporal: {file_path} -> {e}")
+                            
+                            # Los temporales no se marcan como failed en checkpoint todavía, se reintentan
+                            
                             if not detailed_tracker and album_tracker and file_album_mapping and file_path in file_album_mapping:
                                 album_tracker.update_file_progress(file_path, file_album_mapping[file_path], success=False)
         return results, temporary_failures, permanent_failures
@@ -971,7 +1011,8 @@ class Client:
                 target_path=target_path,
                 album_name=album_name,
                 upload_params=upload_params,
-                file_paths=list(path_hash_pairs.keys())
+                file_paths=list(path_hash_pairs.keys()),
+                file_album_mapping=file_album_mapping
             )
 
             # Optimización: Verificar historial local para saltar archivos ya subidos (Deduplicación local)
@@ -1019,6 +1060,7 @@ class Client:
                 saver=saver,
                 file_album_mapping=file_album_mapping,
                 detailed_tracker=detailed_tracker,
+                checkpoint_manager=checkpoint_manager,
             )
             all_results.update(results)
             

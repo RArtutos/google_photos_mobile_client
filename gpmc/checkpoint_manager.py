@@ -93,7 +93,8 @@ class CheckpointManager:
     
     def create_checkpoint(self, target_path: str, album_name: Optional[str],
                          upload_params: Dict[str, Any], 
-                         file_paths: List[Path]) -> str:
+                         file_paths: List[Path],
+                         file_album_mapping: Dict[Path, str] | None = None) -> str:
         """
         Crear un nuevo checkpoint para una sesión de subida.
         
@@ -102,6 +103,7 @@ class CheckpointManager:
             album_name: Nombre del álbum (si aplica)
             upload_params: Parámetros de la subida
             file_paths: Lista de archivos a subir
+            file_album_mapping: Mapeo opcional de archivos a nombres de álbum específicos
             
         Returns:
             ID de la sesión creada
@@ -116,11 +118,16 @@ class CheckpointManager:
                 # Crear hash simple del path para identificación
                 file_hash = hashlib.md5(str(file_path.absolute()).encode()).hexdigest()[:8]
                 
+                # Determinar nombre de álbum específico
+                specific_album = album_name
+                if file_album_mapping and file_path in file_album_mapping:
+                    specific_album = file_album_mapping[file_path]
+                
                 files[str(file_path.absolute())] = FileCheckpoint(
                     file_path=str(file_path.absolute()),
                     file_size=file_size,
                     file_hash=file_hash,
-                    album_name=album_name,
+                    album_name=specific_album,
                     status=FileStatus.PENDING
                 )
             except Exception as e:
