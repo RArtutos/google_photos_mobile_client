@@ -7,7 +7,7 @@ packages = ["gpmc"]
 
 [project]
 name = "gpmc"
-version = "1.0.0-alpha"
+version = "1.0.0-beta"
 description = "Google Photos client based on reverse engineered mobile API."
 authors = [{ name = "xob0t" }]
 readme = "README.md"
